@@ -41,20 +41,30 @@ test("server-renders the JudgeFlow setup experience", async () => {
 });
 
 test("removes disposable starter assets and keeps API credentials server-only", async () => {
-  const [page, layout, client, tokenRoute, packageJson] = await Promise.all([
+  const [page, layout, client, tokenRoute, analysisRoute, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/JudgeWorkspace.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/realtime-token/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/analyze/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /JudgeWorkspace/);
   assert.match(layout, /transcript-backed workspace/);
   assert.match(client, /\/api\/realtime-token/);
+  assert.match(client, /webkitSpeechRecognition/);
+  assert.match(client, /processLocally/);
+  assert.match(client, /Chrome speech first · OpenAI fallback/);
+  assert.match(client, /scrollHeight/);
+  assert.match(client, /auto-following/);
   assert.doesNotMatch(client, /process\.env\.OPENAI_API_KEY/);
   assert.match(tokenRoute, /process\.env\.OPENAI_API_KEY/);
   assert.match(tokenRoute, /gpt-live-transcribe/);
+  assert.match(client, /ADVISORY JUDGE REVIEW/);
+  assert.match(client, /Use this as my selection/);
+  assert.match(analysisRoute, /suggestedWinner/);
+  assert.match(analysisRoute, /human judge makes the final decision/i);
   assert.match(packageJson, /"name": "judgeflow"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 

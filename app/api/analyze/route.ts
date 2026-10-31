@@ -58,8 +58,41 @@ const analysisSchema = {
       },
       required: ["strengths", "improvements"],
     },
+    judgeReview: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        suggestedWinner: { type: "string", enum: ["A", "B", "no_recommendation"] },
+        confidence: { type: "string", enum: ["low", "moderate", "high"] },
+        headline: { type: "string" },
+        roundReview: { type: "string" },
+        winnerReasoning: { type: "array", items: { type: "string" } },
+        teamA: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            strengths: { type: "array", items: { type: "string" } },
+            improvements: { type: "array", items: { type: "string" } },
+            nextRoundFocus: { type: "string" },
+          },
+          required: ["strengths", "improvements", "nextRoundFocus"],
+        },
+        teamB: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            strengths: { type: "array", items: { type: "string" } },
+            improvements: { type: "array", items: { type: "string" } },
+            nextRoundFocus: { type: "string" },
+          },
+          required: ["strengths", "improvements", "nextRoundFocus"],
+        },
+        caveat: { type: "string" },
+      },
+      required: ["suggestedWinner", "confidence", "headline", "roundReview", "winnerReasoning", "teamA", "teamB", "caveat"],
+    },
   },
-  required: ["summary", "arguments", "responses", "votingIssues", "newArgumentAlerts", "feedback"],
+  required: ["summary", "arguments", "responses", "votingIssues", "newArgumentAlerts", "feedback", "judgeReview"],
 } as const;
 
 function localAnalysis(body: Record<string, unknown>) {
@@ -85,6 +118,24 @@ function localAnalysis(body: Record<string, unknown>) {
     votingIssues: [{ title: "Comparative warrant", comparison: "Compare which side explains its mechanism and impact with the clearest warranted link.", verify: "Check the original transcript before treating an omission as a dropped argument." }],
     newArgumentAlerts: [],
     feedback: { strengths: ["The round has an editable record for verification."], improvements: ["Add an API key for tailored argument matching and feedback."] },
+    judgeReview: {
+      suggestedWinner: "no_recommendation",
+      confidence: "low",
+      headline: "A winner recommendation needs deeper comparative analysis.",
+      roundReview: "The local review preserved both sides' available arguments, but it cannot reliably compare extensions, responses, and impacts without the configured OpenAI analysis service.",
+      winnerReasoning: [],
+      teamA: {
+        strengths: ["Placed an identifiable position into the editable round record."],
+        improvements: ["Make the final extension identify the claim, warrant, impact, and answer to the opposing side."],
+        nextRoundFocus: "State exactly why the surviving argument outweighs the opponent's best response.",
+      },
+      teamB: {
+        strengths: ["Placed an identifiable position into the editable round record."],
+        improvements: ["Make the final extension identify the claim, warrant, impact, and answer to the opposing side."],
+        nextRoundFocus: "State exactly why the surviving argument outweighs the opponent's best response.",
+      },
+      caveat: "No winner is recommended in local fallback mode. The human judge must verify the transcript and make the decision.",
+    },
     source: "local",
   };
 }
@@ -116,7 +167,7 @@ export async function POST(request: Request) {
           content: [
             {
               type: "input_text",
-              text: "You organize a high-school debate flow for a human judge. Analyze only arguments actually present in the provided transcript. Never decide the winner. Never invent evidence, warrants, concessions, or speaker attribution. Use short verbatim transcript excerpts as traceability anchors. Treat a possible dropped argument as uncertain unless the transcript clearly shows it. Flag possible new arguments in PF summary/final focus or LD NR/2AR, but instruct the judge to verify. Give balanced, specific strengths and improvements.",
+              text: "You are an advisory assistant to a human high-school debate judge. Analyze only arguments actually present in the supplied transcript and notes. Never invent evidence, warrants, concessions, or speaker attribution. Use short verbatim transcript excerpts as traceability anchors. Treat a possible dropped argument as uncertain unless the transcript clearly shows it. Flag possible new arguments in PF summary/final focus or LD NR/2AR and tell the judge to verify. Then write a balanced judge review: summarize the round, recommend Side A or Side B only when the transcript supports a comparative decision, explain the recommendation through argument logic and final extensions, and give each team specific strengths, improvements, and one next-round focus. If the record is incomplete or too close, return no_recommendation. Do not use speaking style, identity, school, or presentation quality to recommend the winner; those belong only in speaker points. Be constructive and age-appropriate. Clearly state that the recommendation is advisory and the human judge makes the final decision.",
             },
           ],
         },

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 type EventType = "PF" | "LD";
 type AudioSource = "tab" | "microphone";
+type TranscriptionEngine = "browser" | "openai" | "demo";
 type Stage = "setup" | "round" | "decision" | "ballot";
 type SideKey = "A" | "B" | "Both";
 type SpeechStatus = "upcoming" | "active" | "complete";
@@ -55,6 +56,23 @@ type VotingIssue = {
   verify: string;
 };
 
+type TeamReview = {
+  strengths: string[];
+  improvements: string[];
+  nextRoundFocus: string;
+};
+
+type JudgeReview = {
+  suggestedWinner: "A" | "B" | "no_recommendation";
+  confidence: "low" | "moderate" | "high";
+  headline: string;
+  roundReview: string;
+  winnerReasoning: string[];
+  teamA: TeamReview;
+  teamB: TeamReview;
+  caveat: string;
+};
+
 type Analysis = {
   summary: string;
   arguments: ArgumentItem[];
@@ -65,6 +83,7 @@ type Analysis = {
     strengths: string[];
     improvements: string[];
   };
+  judgeReview: JudgeReview;
   source: "openai" | "local" | "sample";
 };
 
@@ -91,7 +110,65 @@ type SavedState = {
   ballot: BallotDraft | null;
 };
 
+type BrowserSpeechResult = {
+  isFinal: boolean;
+  0: { transcript: string; confidence: number };
+};
+
+type BrowserSpeechEvent = {
+  resultIndex: number;
+  results: { length: number; [index: number]: BrowserSpeechResult };
+};
+
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives: number;
+  processLocally?: boolean;
+  onstart: (() => void) | null;
+  onresult: ((event: BrowserSpeechEvent) => void) | null;
+  onerror: ((event: { error: string; message?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+type BrowserSpeechConstructor = {
+  new (): BrowserSpeechRecognition;
+  available?: (options: { langs: string[]; processLocally: boolean; quality?: "conversation" }) => Promise<"unavailable" | "downloadable" | "downloading" | "available">;
+};
+
+function getBrowserSpeechConstructor() {
+  if (typeof window === "undefined") return null;
+  const speechWindow = window as Window & {
+    SpeechRecognition?: BrowserSpeechConstructor;
+    webkitSpeechRecognition?: BrowserSpeechConstructor;
+  };
+  return speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition || null;
+}
+
 const STORAGE_KEY = "judgeflow-round-v1";
+
+const EMPTY_JUDGE_REVIEW: JudgeReview = {
+  suggestedWinner: "no_recommendation",
+  confidence: "low",
+  headline: "Complete the transcript before requesting a recommendation.",
+  roundReview: "JudgeFlow needs both sides' arguments to write a comparative review.",
+  winnerReasoning: [],
+  teamA: {
+    strengths: [],
+    improvements: ["Complete or paste this side's speeches so the review can cite the round."],
+    nextRoundFocus: "Build a clear claim, warrant, impact, and final comparison.",
+  },
+  teamB: {
+    strengths: [],
+    improvements: ["Complete or paste this side's speeches so the review can cite the round."],
+    nextRoundFocus: "Build a clear claim, warrant, impact, and final comparison.",
+  },
+  caveat: "This is an advisory review. The human judge verifies the flow and makes the decision.",
+};
 
 const EMPTY_ANALYSIS: Analysis = {
   summary: "Complete a speech, then ask JudgeFlow to organize the round.",
@@ -100,6 +177,7 @@ const EMPTY_ANALYSIS: Analysis = {
   votingIssues: [],
   newArgumentAlerts: [],
   feedback: { strengths: [], improvements: [] },
+  judgeReview: EMPTY_JUDGE_REVIEW,
   source: "local",
 };
 
@@ -111,7 +189,7 @@ const DEFAULT_SETUP: RoundSetup = {
   teamB: "Team B",
   speakersA: ["Pro 1", "Pro 2"],
   speakersB: ["Con 1", "Con 2"],
-  audioSource: "tab",
+  audioSource: "microphone",
   authorized: false,
   judgeOwnsDecision: false,
 };
@@ -223,6 +301,41 @@ const SAMPLE_ANALYSIS: Analysis = {
     strengths: ["Both sides collapse toward a clear final comparison.", "Rebuttals directly engage the opposing mechanism."],
     improvements: ["Quantify timelines and capacity.", "Explain evidence methodology when citing project performance."],
   },
+  judgeReview: {
+    suggestedWinner: "B",
+    confidence: "moderate",
+    headline: "Con has the clearer comparative path on the available record.",
+    roundReview:
+      "This is a close reliability-versus-speed debate. Pro identifies a meaningful need for firm clean power, but Con more consistently turns the comparison toward deployment time, cost, and near-term emissions. On the visible transcript, Pro never supplies the timeline or capacity comparison needed to overcome Con's impact framing.",
+    winnerReasoning: [
+      "Con extends a concrete time-horizon comparison through rebuttal and summary.",
+      "Pro's reliability mechanism remains important but under-quantified on deployment date and capacity.",
+      "Con explains why near-term emissions reductions should be preferred when climate harms compound.",
+    ],
+    teamA: {
+      strengths: [
+        "Identified a specific reliability problem that faster resources still need to solve.",
+        "Directly answered the claim that federal investment must be zero-sum.",
+      ],
+      improvements: [
+        "Give a warranted deployment timeline and capacity estimate instead of relying on a general promise of advanced designs.",
+        "Compare the scale of long-duration reliability benefits directly against Con's near-term emissions impact.",
+      ],
+      nextRoundFocus: "Quantify the link: when the investment produces capacity, how much it produces, and why that outweighs faster alternatives.",
+    },
+    teamB: {
+      strengths: [
+        "Maintained a consistent time-horizon framework from constructive through summary.",
+        "Pressed the missing timeline, capacity, and cost comparisons in Pro's case.",
+      ],
+      improvements: [
+        "Warrant how transmission and storage perform during the prolonged renewable shortfalls Pro identifies.",
+        "Clarify whether the opportunity cost is fiscal, labor-based, transmission-based, or all three.",
+      ],
+      nextRoundFocus: "Strengthen the reliability response so the ballot does not depend only on Pro's missing quantification.",
+    },
+    caveat: "Suggested winner only. Verify the full final-focus record and your own flow before selecting the winner.",
+  },
   source: "sample",
 };
 
@@ -304,6 +417,21 @@ function makeLocalAnalysis(setup: RoundSetup, speeches: Speech[]): Analysis {
       strengths: ["The available transcript preserves a record for post-round verification."],
       improvements: ["Add an OpenAI API key for transcript-backed response matching and tailored feedback."],
     },
+    judgeReview: {
+      ...EMPTY_JUDGE_REVIEW,
+      headline: "A winner recommendation needs deeper comparative analysis.",
+      roundReview: `The local review found ${sideA.length} transcribed speeches for ${setup.teamA} and ${sideB.length} for ${setup.teamB}. Configure an OpenAI API key to compare extensions, responses, and impacts without inventing a decision.`,
+      teamA: {
+        strengths: sideA.length ? ["Placed at least one identifiable position into the transcript."] : [],
+        improvements: ["Make the final extension identify the claim, warrant, impact, and response to the opposing side."],
+        nextRoundFocus: "State exactly why your surviving argument outweighs the opponent's best response.",
+      },
+      teamB: {
+        strengths: sideB.length ? ["Placed at least one identifiable position into the transcript."] : [],
+        improvements: ["Make the final extension identify the claim, warrant, impact, and response to the opposing side."],
+        nextRoundFocus: "State exactly why your surviving argument outweighs the opponent's best response.",
+      },
+    },
     source: "local",
   };
 }
@@ -345,6 +473,7 @@ export default function JudgeWorkspace() {
   const [timerRunning, setTimerRunning] = useState(false);
   const [listenStatus, setListenStatus] = useState<"idle" | "connecting" | "listening" | "error">("idle");
   const [listenMessage, setListenMessage] = useState("Audio is off");
+  const [transcriptionEngine, setTranscriptionEngine] = useState<TranscriptionEngine | null>(null);
   const [livePartial, setLivePartial] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
   const [drafting, setDrafting] = useState(false);
@@ -354,8 +483,14 @@ export default function JudgeWorkspace() {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
+  const browserRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const shouldListenRef = useRef(false);
+  const engineRef = useRef<TranscriptionEngine | null>(null);
+  const fallbackStartingRef = useRef(false);
   const demoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeSpeechRef = useRef(activeSpeechId);
+  const livePartialRef = useRef("");
+  const transcriptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const activeSpeech = speeches.find((speech) => speech.id === activeSpeechId) || speeches[0];
   const completedCount = speeches.filter((speech) => speech.status === "complete").length;
@@ -373,10 +508,22 @@ export default function JudgeWorkspace() {
   const selectedVotingIssues = selectedIssues
     .map((index) => analysis.votingIssues[index])
     .filter(Boolean);
+  const judgeReview = analysis.judgeReview || EMPTY_JUDGE_REVIEW;
+  const suggestedSide = judgeReview.suggestedWinner === "A" || judgeReview.suggestedWinner === "B"
+    ? judgeReview.suggestedWinner
+    : null;
+  const browserSpeechAvailable = hydrated && Boolean(getBrowserSpeechConstructor());
 
   useEffect(() => {
     activeSpeechRef.current = activeSpeechId;
   }, [activeSpeechId]);
+
+  useEffect(() => {
+    if (listenStatus !== "listening") return;
+    const transcriptField = transcriptTextareaRef.current;
+    if (!transcriptField) return;
+    transcriptField.scrollTop = transcriptField.scrollHeight;
+  }, [activeSpeechId, activeSpeech.transcript, livePartial, listenStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -390,7 +537,10 @@ export default function JudgeWorkspace() {
           setStage(parsed.stage);
           setSpeeches(parsed.speeches);
           setActiveSpeechId(parsed.activeSpeechId);
-          setAnalysis(parsed.analysis);
+          setAnalysis({
+            ...parsed.analysis,
+            judgeReview: parsed.analysis.judgeReview || EMPTY_JUDGE_REVIEW,
+          });
           setWinner(parsed.winner);
           setSelectedIssues(parsed.selectedIssues);
           setPoints(parsed.points);
@@ -436,6 +586,8 @@ export default function JudgeWorkspace() {
   useEffect(() => {
     return () => {
       if (demoIntervalRef.current) clearInterval(demoIntervalRef.current);
+      shouldListenRef.current = false;
+      browserRecognitionRef.current?.abort();
       channelRef.current?.close();
       peerRef.current?.close();
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -516,7 +668,7 @@ export default function JudgeWorkspace() {
     setActiveSpeechId(id);
     setElapsed(0);
     setTimerRunning(false);
-    setLivePartial("");
+    replaceLivePartial("");
   }
 
   function updateSpeech(id: string, patch: Partial<Speech>) {
@@ -534,9 +686,23 @@ export default function JudgeWorkspace() {
     );
   }
 
+  function replaceLivePartial(text: string) {
+    livePartialRef.current = text;
+    setLivePartial(text);
+  }
+
+  function appendLivePartial(text: string) {
+    setLivePartial((current) => {
+      const next = current + text;
+      livePartialRef.current = next;
+      return next;
+    });
+  }
+
   function commitPartial() {
-    if (livePartial.trim()) appendTranscript(activeSpeechRef.current, livePartial);
-    setLivePartial("");
+    const partial = livePartialRef.current;
+    if (partial.trim()) appendTranscript(activeSpeechRef.current, partial);
+    replaceLivePartial("");
   }
 
   function completeSpeech() {
@@ -568,12 +734,131 @@ export default function JudgeWorkspace() {
       setToast("Confirm authorization before capturing audio.");
       return;
     }
+    shouldListenRef.current = true;
+    fallbackStartingRef.current = false;
     setListenStatus("connecting");
-    setListenMessage("Connecting securely…");
+    setListenMessage("Selecting the best transcription service…");
+    const BrowserSpeech = getBrowserSpeechConstructor();
+    if (setup.audioSource === "microphone" && BrowserSpeech) {
+      await startBrowserListening(BrowserSpeech);
+      return;
+    }
+    await startOpenAIListening(
+      setup.audioSource === "tab"
+        ? "Shared-tab audio uses OpenAI transcription."
+        : "Browser speech is unavailable; using OpenAI.",
+    );
+  }
+
+  async function startBrowserListening(BrowserSpeech: BrowserSpeechConstructor) {
+    const recognition = new BrowserSpeech();
+    let localProcessing = false;
+    if (BrowserSpeech.available && "processLocally" in recognition) {
+      try {
+        const availability = await BrowserSpeech.available({ langs: ["en-US"], processLocally: true, quality: "conversation" });
+        if (availability === "available") {
+          recognition.processLocally = true;
+          localProcessing = true;
+        }
+      } catch {
+        // Older Chrome builds can expose SpeechRecognition without the on-device availability API.
+      }
+    }
+    if (!shouldListenRef.current) return;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+    recognition.maxAlternatives = 1;
+    browserRecognitionRef.current = recognition;
+    engineRef.current = "browser";
+    setTranscriptionEngine("browser");
+
+    recognition.onstart = () => {
+      if (!shouldListenRef.current) {
+        recognition.abort();
+        return;
+      }
+      setListenStatus("listening");
+      setListenMessage(localProcessing ? "Chrome on-device speech · microphone" : "Chrome browser speech · microphone");
+    };
+    recognition.onresult = (event) => {
+      if (!shouldListenRef.current || engineRef.current !== "browser") return;
+      let finalText = "";
+      let interimText = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result?.[0]?.transcript || "";
+        if (result?.isFinal) finalText += transcript;
+        else interimText += transcript;
+      }
+      if (finalText.trim()) appendTranscript(activeSpeechRef.current, finalText);
+      replaceLivePartial(interimText);
+    };
+    recognition.onerror = (event) => {
+      if (event.error === "aborted" && !shouldListenRef.current) return;
+      if (event.error === "no-speech") {
+        setListenMessage("Browser speech is waiting for someone to speak");
+        return;
+      }
+      if (event.error === "not-allowed" || event.error === "audio-capture") {
+        shouldListenRef.current = false;
+        engineRef.current = null;
+        browserRecognitionRef.current = null;
+        setTranscriptionEngine(null);
+        setListenStatus("error");
+        setListenMessage(event.error === "not-allowed" ? "Microphone permission was denied." : "Chrome could not access the microphone.");
+        return;
+      }
+      void fallbackToOpenAI(`Browser speech reported ${event.error}.`);
+    };
+    recognition.onend = () => {
+      if (!shouldListenRef.current || engineRef.current !== "browser" || fallbackStartingRef.current) return;
+      try {
+        recognition.start();
+      } catch {
+        window.setTimeout(() => {
+          if (shouldListenRef.current && engineRef.current === "browser") {
+            try {
+              recognition.start();
+            } catch {
+              void fallbackToOpenAI("Browser speech stopped unexpectedly.");
+            }
+          }
+        }, 300);
+      }
+    };
+
+    try {
+      recognition.start();
+    } catch {
+      void fallbackToOpenAI("Browser speech could not start.");
+    }
+  }
+
+  async function fallbackToOpenAI(reason: string) {
+    if (fallbackStartingRef.current || !shouldListenRef.current) return;
+    fallbackStartingRef.current = true;
+    commitPartial();
+    browserRecognitionRef.current?.abort();
+    browserRecognitionRef.current = null;
+    await startOpenAIListening(`${reason} Switching to OpenAI…`);
+    fallbackStartingRef.current = false;
+  }
+
+  async function startOpenAIListening(reason?: string) {
+    engineRef.current = "openai";
+    setTranscriptionEngine("openai");
+    setListenStatus("connecting");
+    setListenMessage(reason || "Connecting to OpenAI transcription…");
     try {
       const stream = setup.audioSource === "tab"
         ? await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
         : await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!shouldListenRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      streamRef.current = stream;
       const audioTrack = stream.getAudioTracks()[0];
       if (!audioTrack) {
         stream.getTracks().forEach((track) => track.stop());
@@ -590,32 +875,45 @@ export default function JudgeWorkspace() {
         stream.getTracks().forEach((track) => track.stop());
         throw new Error(tokenData.error || "Live transcription is not configured.");
       }
+      if (!shouldListenRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
 
       const peer = new RTCPeerConnection();
       const channel = peer.createDataChannel("oai-events");
       peer.addTrack(audioTrack, stream);
+      peerRef.current = peer;
+      channelRef.current = channel;
       channel.addEventListener("message", (message) => {
         const event = JSON.parse(message.data) as { type: string; delta?: string; transcript?: string; error?: { message?: string } };
         if (event.type === "conversation.item.input_audio_transcription.delta" && event.delta) {
-          setLivePartial((current) => current + event.delta);
+          appendLivePartial(event.delta);
         }
         if (event.type === "conversation.item.input_audio_transcription.completed" && event.transcript) {
           appendTranscript(activeSpeechRef.current, event.transcript);
-          setLivePartial("");
+          replaceLivePartial("");
         }
         if (event.type === "error") {
+          const message = event.error?.message || "The transcription session reported an error.";
+          stopListening(false);
           setListenStatus("error");
-          setListenMessage(event.error?.message || "The transcription session reported an error.");
+          setListenMessage(message);
         }
       });
       channel.addEventListener("open", () => {
+        if (!shouldListenRef.current) {
+          stopListening();
+          return;
+        }
         setListenStatus("listening");
-        setListenMessage(setup.audioSource === "tab" ? "Listening to shared audio" : "Listening through microphone");
+        setListenMessage(setup.audioSource === "tab" ? "OpenAI · shared tab audio" : "OpenAI fallback · microphone");
       });
       peer.addEventListener("connectionstatechange", () => {
-        if (["failed", "disconnected", "closed"].includes(peer.connectionState)) {
-          setListenStatus(peer.connectionState === "closed" ? "idle" : "error");
-          setListenMessage(peer.connectionState === "closed" ? "Audio is off" : "Audio connection lost");
+        if (["failed", "disconnected"].includes(peer.connectionState) && shouldListenRef.current) {
+          stopListening(false);
+          setListenStatus("error");
+          setListenMessage("Audio connection lost");
         }
       });
 
@@ -630,15 +928,28 @@ export default function JudgeWorkspace() {
         },
       });
       if (!answerResponse.ok) throw new Error("OpenAI could not start the audio session.");
-      await peer.setRemoteDescription({ type: "answer", sdp: await answerResponse.text() });
+      const answerSdp = await answerResponse.text();
+      if (!shouldListenRef.current) {
+        stopListening(false);
+        return;
+      }
+      await peer.setRemoteDescription({ type: "answer", sdp: answerSdp });
 
-      streamRef.current = stream;
-      peerRef.current = peer;
-      channelRef.current = channel;
     } catch (error) {
-      stopListening(false);
-      setListenStatus("error");
-      setListenMessage(error instanceof Error ? error.message : "Could not start audio capture.");
+      const shouldReportError = shouldListenRef.current;
+      shouldListenRef.current = false;
+      channelRef.current?.close();
+      peerRef.current?.close();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      channelRef.current = null;
+      peerRef.current = null;
+      streamRef.current = null;
+      engineRef.current = null;
+      setTranscriptionEngine(null);
+      if (shouldReportError) {
+        setListenStatus("error");
+        setListenMessage(error instanceof Error ? error.message : "Could not start audio capture.");
+      }
     }
   }
 
@@ -648,7 +959,10 @@ export default function JudgeWorkspace() {
       "The key comparison is whether near-term deployment outweighs long-term grid reliability. Our opponents have not quantified the duration of the shortfall or explained why their alternative solves during prolonged low-wind periods.";
     const words = script.split(" ");
     let index = 0;
-    setLivePartial("");
+    shouldListenRef.current = false;
+    engineRef.current = "demo";
+    setTranscriptionEngine("demo");
+    replaceLivePartial("");
     setListenStatus("listening");
     setListenMessage("Demo audio — simulated transcript");
     demoIntervalRef.current = setInterval(() => {
@@ -658,20 +972,27 @@ export default function JudgeWorkspace() {
         return;
       }
       const word = words[index++];
-      setLivePartial((current) => `${current}${current ? " " : ""}${word}`);
+      const separator = livePartialRef.current ? " " : "";
+      appendLivePartial(`${separator}${word}`);
     }, 180);
   }
 
   function stopListening(updateStatus = true) {
-    if (livePartial.trim()) commitPartial();
+    shouldListenRef.current = false;
+    fallbackStartingRef.current = false;
+    if (livePartialRef.current.trim()) commitPartial();
     if (demoIntervalRef.current) clearInterval(demoIntervalRef.current);
     demoIntervalRef.current = null;
+    browserRecognitionRef.current?.abort();
+    browserRecognitionRef.current = null;
     channelRef.current?.close();
     peerRef.current?.close();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     channelRef.current = null;
     peerRef.current = null;
     streamRef.current = null;
+    engineRef.current = null;
+    setTranscriptionEngine(null);
     if (updateStatus) {
       setListenStatus("idle");
       setListenMessage("Audio is off");
@@ -866,13 +1187,14 @@ export default function JudgeWorkspace() {
               <legend>Audio source</legend>
               <label className={setup.audioSource === "tab" ? "selected" : ""}>
                 <input type="radio" name="audio" checked={setup.audioSource === "tab"} onChange={() => updateSetup("audioSource", "tab")} />
-                <span className="radio-dot" /><span><strong>Shared debate tab</strong><small>Best for browser-based rounds</small></span>
+                <span className="radio-dot" /><span><strong>Shared debate tab</strong><small>OpenAI captures the shared tab audio</small></span>
               </label>
               <label className={setup.audioSource === "microphone" ? "selected" : ""}>
                 <input type="radio" name="audio" checked={setup.audioSource === "microphone"} onChange={() => updateSetup("audioSource", "microphone")} />
-                <span className="radio-dot" /><span><strong>Room microphone</strong><small>Fallback for speaker audio</small></span>
+                <span className="radio-dot" /><span><strong>Room microphone</strong><small>{browserSpeechAvailable ? "Chrome speech first · OpenAI fallback" : "OpenAI fallback on this browser"}</small></span>
               </label>
             </fieldset>
+            <p className="engine-note"><strong>Automatic transcription:</strong> JudgeFlow prefers Chrome speech for microphone capture when available, including on-device recognition when installed. Shared-tab audio and browser-service failures use OpenAI.</p>
 
             <div className="safeguard-box">
               <label>
@@ -949,6 +1271,7 @@ export default function JudgeWorkspace() {
                   <span className="status-orb" />
                   <div><strong>{listenStatus === "listening" ? "Transcription on" : listenStatus === "connecting" ? "Connecting" : listenStatus === "error" ? "Audio needs attention" : "Transcription off"}</strong><small>{listenMessage}</small></div>
                 </div>
+                {transcriptionEngine && <span className={`engine-badge engine-${transcriptionEngine}`}>{transcriptionEngine === "browser" ? "Chrome speech" : transcriptionEngine === "openai" ? "OpenAI fallback" : "Simulation"}</span>}
                 <div className="waveform" aria-hidden="true">
                   {Array.from({ length: 18 }, (_, index) => <i key={index} style={{ height: listenStatus === "listening" ? `${8 + ((index * 13) % 24)}px` : "5px" }} />)}
                 </div>
@@ -962,11 +1285,12 @@ export default function JudgeWorkspace() {
 
               <div className="editor-grid">
                 <label>
-                  <span>LIVE TRANSCRIPT <small>editable</small></span>
+                  <span>LIVE TRANSCRIPT <small>{listenStatus === "listening" ? "auto-following" : "editable"}</small></span>
                   <textarea
+                    ref={transcriptTextareaRef}
                     value={`${activeSpeech.transcript}${livePartial ? `${activeSpeech.transcript ? " " : ""}${livePartial}` : ""}`}
                     onChange={(event) => {
-                      setLivePartial("");
+                      replaceLivePartial("");
                       updateSpeech(activeSpeech.id, { transcript: event.target.value });
                     }}
                     placeholder="Start listening, simulate a transcript, or type notes from the speech here…"
@@ -1033,7 +1357,7 @@ export default function JudgeWorkspace() {
       {stage === "decision" && (
         <section className="decision-page">
           <div className="page-title-row">
-            <div><span className="eyebrow">HUMAN DECISION</span><h1>Compare first. Decide second.</h1><p>JudgeFlow surfaces transcript-backed clashes. You determine what wins the round.</p></div>
+            <div><span className="eyebrow">JUDGE REVIEW</span><h1>Review the round. Make your call.</h1><p>JudgeFlow compares the arguments, recommends a result, and coaches both teams. You make the final decision.</p></div>
             <button className="secondary-button" onClick={analyzeRound} disabled={analyzing}>{analyzing ? "Reviewing…" : "Refresh analysis"}</button>
           </div>
 
@@ -1074,6 +1398,53 @@ export default function JudgeWorkspace() {
               {!analysis.arguments.some((item) => item.side.toLowerCase().includes(setup.teamB.toLowerCase()) || item.side.toLowerCase().includes(setup.event === "PF" ? "con" : "neg")) && <p className="empty-side">No organized claims for this side yet.</p>}
             </div>
           </div>
+
+          <section className="judge-review" aria-labelledby="judge-review-title">
+            <div className="review-heading">
+              <div>
+                <span className="eyebrow">ADVISORY JUDGE REVIEW</span>
+                <h2 id="judge-review-title">{judgeReview.headline}</h2>
+                <p>{judgeReview.roundReview}</p>
+              </div>
+              <div className={`recommendation-card ${suggestedSide ? `recommend-${suggestedSide.toLowerCase()}` : "recommend-none"}`}>
+                <span>SUGGESTED WINNER</span>
+                <strong>{suggestedSide ? getSideName(setup, suggestedSide) : "No recommendation"}</strong>
+                <small>{judgeReview.confidence} confidence · advisory only</small>
+                {suggestedSide && (
+                  <button onClick={() => setWinner(suggestedSide)}>
+                    {winner === suggestedSide ? "✓ Selected as my winner" : "Use this as my selection"}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="review-reasons">
+              <h3>Why this result is suggested</h3>
+              {judgeReview.winnerReasoning.length ? (
+                <ol>
+                  {judgeReview.winnerReasoning.map((reason) => <li key={reason}>{reason}</li>)}
+                </ol>
+              ) : (
+                <p>The current record does not support a responsible winner recommendation. Review the transcript and select the decisive voting issues yourself.</p>
+              )}
+            </div>
+
+            <div className="team-review-grid">
+              {([
+                { key: "A" as const, label: setup.teamA, review: judgeReview.teamA },
+                { key: "B" as const, label: setup.teamB, review: judgeReview.teamB },
+              ]).map(({ key, label, review }) => (
+                <article className={`team-review team-review-${key.toLowerCase()}`} key={key}>
+                  <div className="team-review-title"><span>{key}</span><div><small>{key === "A" ? (setup.event === "PF" ? "PRO" : "AFF") : (setup.event === "PF" ? "CON" : "NEG")}</small><h3>{label}</h3></div></div>
+                  <div className="review-list strength-list"><strong>What worked</strong>{review.strengths.length ? <ul>{review.strengths.map((item) => <li key={item}>{item}</li>)}</ul> : <p>No verified strength was available from the current transcript.</p>}</div>
+                  <div className="review-list improvement-list"><strong>How to improve</strong><ul>{review.improvements.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                  <div className="next-round-focus"><span>NEXT-ROUND FOCUS</span><p>{review.nextRoundFocus}</p></div>
+                </article>
+              ))}
+            </div>
+
+            <p className="review-caveat">{judgeReview.caveat}</p>
+          </section>
 
           <section className="decision-card">
             <div className="winner-section">

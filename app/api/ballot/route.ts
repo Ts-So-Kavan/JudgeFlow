@@ -61,7 +61,7 @@ export async function POST(request: Request) {
       input: [
         {
           role: "developer",
-          content: [{ type: "input_text", text: "Draft a substantial high-school debate ballot from the human judge's explicit winner and selected voting issues. Never change or second-guess the winner. Explain the decisive argument logic, not speaking style. Give every listed speaker one specific strength and one constructive improvement. Do not invent evidence or facts beyond the supplied transcript and analysis. Keep the oral disclosure concise. Do not mention AI." }],
+          content: [{ type: "input_text", text: "Draft a substantial high-school debate ballot from the human judge's explicit winner and selected voting issues. Never change or second-guess the human judge's winner, even if the earlier advisory review recommended the other side. Explain the decisive argument logic, not speaking style. Use the team coaching in judgeReview when it is supported by the transcript, and give every listed speaker one specific strength and one constructive improvement. Do not invent evidence or facts beyond the supplied transcript and analysis. Keep the oral disclosure concise. Do not mention AI." }],
         },
         { role: "user", content: [{ type: "input_text", text: JSON.stringify(body) }] },
       ],
