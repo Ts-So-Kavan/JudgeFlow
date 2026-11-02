@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "JudgeFlow Tabroom Companion",
+  "version": "0.1.0",
+  "description": "Transfers a reviewed JudgeFlow ballot into Tabroom for the judge to verify and submit.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://www.tabroom.com/*"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "action": {
+    "default_title": "JudgeFlow Tabroom Companion",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*"],
+      "js": ["judgeflow-bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.tabroom.com/*"],
+      "js": ["tabroom-autofill.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

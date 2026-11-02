@@ -98,6 +98,8 @@ type BallotDraft = {
   source: "openai" | "local";
 };
 
+type TabroomBridgeStatus = "checking" | "connected" | "missing" | "sending" | "queued" | "error";
+
 type SavedState = {
   setup: RoundSetup;
   stage: Stage;
@@ -479,6 +481,8 @@ export default function JudgeWorkspace() {
   const [drafting, setDrafting] = useState(false);
   const [toast, setToast] = useState("");
   const [hydrated, setHydrated] = useState(false);
+  const [tabroomBridgeStatus, setTabroomBridgeStatus] = useState<TabroomBridgeStatus>("checking");
+  const [tabroomBridgeMessage, setTabroomBridgeMessage] = useState("Checking for the Chrome companion…");
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -491,6 +495,8 @@ export default function JudgeWorkspace() {
   const activeSpeechRef = useRef(activeSpeechId);
   const livePartialRef = useRef("");
   const transcriptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const tabroomRequestRef = useRef<string | null>(null);
+  const tabroomTimeoutRef = useRef<number | null>(null);
 
   const activeSpeech = speeches.find((speech) => speech.id === activeSpeechId) || speeches[0];
   const completedCount = speeches.filter((speech) => speech.status === "complete").length;
@@ -513,10 +519,46 @@ export default function JudgeWorkspace() {
     ? judgeReview.suggestedWinner
     : null;
   const browserSpeechAvailable = hydrated && Boolean(getBrowserSpeechConstructor());
+  const tabroomConnected = tabroomBridgeStatus === "connected" || tabroomBridgeStatus === "queued" || tabroomBridgeStatus === "sending";
 
   useEffect(() => {
     activeSpeechRef.current = activeSpeechId;
   }, [activeSpeechId]);
+
+  useEffect(() => {
+    const handleCompanionMessage = (event: MessageEvent) => {
+      if (event.source !== window || event.origin !== window.location.origin) return;
+      const message = event.data as { source?: string; type?: string; requestId?: string; ok?: boolean; error?: string | null; version?: string };
+      if (message.source !== "judgeflow-tabroom-companion") return;
+      if (message.type === "JUDGEFLOW_TABROOM_READY") {
+        if (tabroomTimeoutRef.current) window.clearTimeout(tabroomTimeoutRef.current);
+        setTabroomBridgeStatus((current) => current === "sending" || current === "queued" ? current : "connected");
+        setTabroomBridgeMessage(`Companion connected${message.version ? ` · v${message.version}` : ""}`);
+        return;
+      }
+      if (message.type !== "JUDGEFLOW_TABROOM_RESULT" || message.requestId !== tabroomRequestRef.current) return;
+      if (tabroomTimeoutRef.current) window.clearTimeout(tabroomTimeoutRef.current);
+      tabroomRequestRef.current = null;
+      if (message.ok) {
+        setTabroomBridgeStatus("queued");
+        setTabroomBridgeMessage("Ballot sent. Continue in the Tabroom tab.");
+        setToast("Ballot sent to the Tabroom companion for review.");
+      } else {
+        setTabroomBridgeStatus("error");
+        setTabroomBridgeMessage(message.error || "The companion could not receive this ballot.");
+      }
+    };
+    window.addEventListener("message", handleCompanionMessage);
+    window.postMessage({ source: "judgeflow", type: "JUDGEFLOW_TABROOM_PING" }, window.location.origin);
+    tabroomTimeoutRef.current = window.setTimeout(() => {
+      setTabroomBridgeStatus((current) => current === "checking" ? "missing" : current);
+      setTabroomBridgeMessage((current) => current.startsWith("Checking") ? "Companion not detected. Load the extension and reload JudgeFlow in Chrome." : current);
+    }, 1400);
+    return () => {
+      window.removeEventListener("message", handleCompanionMessage);
+      if (tabroomTimeoutRef.current) window.clearTimeout(tabroomTimeoutRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (listenStatus !== "listening") return;
@@ -1060,6 +1102,75 @@ export default function JudgeWorkspace() {
     navigator.clipboard.writeText(text).then(() => setToast(`${label} copied.`));
   }
 
+  function checkTabroomCompanion() {
+    setTabroomBridgeStatus("checking");
+    setTabroomBridgeMessage("Checking for the Chrome companion…");
+    window.postMessage({ source: "judgeflow", type: "JUDGEFLOW_TABROOM_PING" }, window.location.origin);
+    if (tabroomTimeoutRef.current) window.clearTimeout(tabroomTimeoutRef.current);
+    tabroomTimeoutRef.current = window.setTimeout(() => {
+      setTabroomBridgeStatus((current) => current === "checking" ? "missing" : current);
+      setTabroomBridgeMessage((current) => current.startsWith("Checking") ? "Companion not detected. Load the extension and reload JudgeFlow in Chrome." : current);
+    }, 1400);
+  }
+
+  function sendBallotToTabroom() {
+    if (!ballot || (winner !== "A" && winner !== "B")) {
+      setToast("Finish the ballot and choose a winner before sending it to Tabroom.");
+      return;
+    }
+    if (!pointRangeValid || hasPointTie) {
+      setToast("Resolve speaker-point errors before sending the ballot.");
+      return;
+    }
+    if (!tabroomConnected) {
+      checkTabroomCompanion();
+      return;
+    }
+    const winnerRole = winner === "A"
+      ? (setup.event === "PF" ? "Pro" : "Aff")
+      : (setup.event === "PF" ? "Con" : "Neg");
+    const payload = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      round: {
+        event: setup.event,
+        tournament: setup.tournament,
+        resolution: setup.resolution,
+        teamA: setup.teamA,
+        teamB: setup.teamB,
+      },
+      decision: {
+        winnerSide: winner,
+        winnerLabel: getSideName(setup, winner),
+        winnerRole,
+      },
+      points: speakerRows.map((row) => ({
+        key: row.key,
+        speaker: row.name,
+        team: row.side,
+        role: row.key.startsWith("A-") ? (setup.event === "PF" ? "Pro" : "Aff") : (setup.event === "PF" ? "Con" : "Neg"),
+        value: points[row.key],
+      })),
+      ballot: {
+        rfd: ballot.rfd,
+        oralDisclosure: ballot.oralDisclosure,
+        feedback: ballot.feedback,
+      },
+    };
+    const requestId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    tabroomRequestRef.current = requestId;
+    setTabroomBridgeStatus("sending");
+    setTabroomBridgeMessage("Sending the reviewed ballot to the companion…");
+    window.postMessage({ source: "judgeflow", type: "JUDGEFLOW_TABROOM_QUEUE", requestId, payload }, window.location.origin);
+    if (tabroomTimeoutRef.current) window.clearTimeout(tabroomTimeoutRef.current);
+    tabroomTimeoutRef.current = window.setTimeout(() => {
+      if (tabroomRequestRef.current !== requestId) return;
+      tabroomRequestRef.current = null;
+      setTabroomBridgeStatus("error");
+      setTabroomBridgeMessage("No response from the companion. Reload JudgeFlow and try again.");
+    }, 5000);
+  }
+
   function exportRound() {
     const payload = JSON.stringify({ setup, speeches, analysis, winner, selectedIssues, points, ballot }, null, 2);
     const blob = new Blob([payload], { type: "application/json" });
@@ -1516,10 +1627,23 @@ export default function JudgeWorkspace() {
                 <li className={ballot.rfd.length > 100 ? "done" : ""}>Substantial reason for decision</li>
                 <li className={ballot.feedback.every((item) => item.strengths && item.improvements) ? "done" : ""}>Strength and improvement for each speaker</li>
                 <li className={!hasPointTie && pointRangeValid ? "done" : ""}>Valid, untied speaker points</li>
-                <li className="manual">Submit and confirm on Tabroom yourself</li>
+                <li className={tabroomConnected ? "done" : "manual"}>Chrome companion connected</li>
+                <li className="manual">Review, submit, and confirm on Tabroom yourself</li>
               </ul>
-              <button className="primary-button" onClick={() => copyText(`Reason for decision\n${ballot.rfd}\n\nFeedback\n${ballot.feedback.map((item) => `${item.speaker}: ${item.strengths} Improvement: ${item.improvements}`).join("\n")}`, "Full ballot")}>Copy full ballot <span>→</span></button>
-              <p>Submit before giving oral feedback. JudgeFlow never accesses or submits to Tabroom.</p>
+              <div className={`tabroom-transfer bridge-${tabroomBridgeStatus}`}>
+                <div className="bridge-status"><span /><div><strong>Tabroom Companion</strong><small>{tabroomBridgeMessage}</small></div></div>
+                <button
+                  className="primary-button"
+                  onClick={tabroomConnected ? sendBallotToTabroom : checkTabroomCompanion}
+                  disabled={tabroomBridgeStatus === "checking" || tabroomBridgeStatus === "sending"}
+                >
+                  {tabroomBridgeStatus === "sending" ? "Opening Tabroom…" : tabroomConnected ? (tabroomBridgeStatus === "queued" ? "Send updated ballot" : "Send to Tabroom") : tabroomBridgeStatus === "checking" ? "Checking companion…" : "Check companion"}
+                  <span>→</span>
+                </button>
+                {!tabroomConnected && <p>Local prototype: load the <code>extension</code> folder at <code>chrome://extensions</code>, then reload JudgeFlow in Chrome.</p>}
+              </div>
+              <button className="submission-copy" onClick={() => copyText(`Reason for decision\n${ballot.rfd}\n\nFeedback\n${ballot.feedback.map((item) => `${item.speaker}: ${item.strengths} Improvement: ${item.improvements}`).join("\n")}`, "Full ballot")}>Copy full ballot as backup</button>
+              <p>Submit before giving oral feedback. The companion fills fields but never submits or confirms the ballot.</p>
             </aside>
           </div>
         </section>
